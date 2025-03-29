@@ -1,3 +1,5 @@
+import xml.etree.ElementTree as ET
+
 class Model:
     def __init__(self, rows, cols):
         self.rows = rows
@@ -6,7 +8,7 @@ class Model:
         self.pixel_field = [[0 for _ in range(cols)] for _ in range(rows)]
 
     def add_vertex(self, x, y):
-        if self.pixel_field[y][x] == 0:
+        if 0 <= x < self.cols and 0 <= y < self.rows and self.pixel_field[y][x] == 0:
             self.vertices.append((x, y))
             self.update_field()
 
@@ -50,3 +52,39 @@ class Model:
         self.cols = new_cols
         self.vertices = []
         self.pixel_field = [[0 for _ in range(new_cols)] for _ in range(new_rows)]
+
+    def get_vertices_string(self):
+        return "    ".join(f"x: {x}, y: {y}" for x, y in self.vertices)
+
+    def save_to_xml(self, filename="template.xml"):
+        root = ET.Element("template")
+        size = ET.SubElement(root, "size")
+        size.set("rows", str(self.rows))
+        size.set("cols", str(self.cols))
+        vertices = ET.SubElement(root, "vertices")
+        for x, y in self.vertices:
+            vertex = ET.SubElement(vertices, "vertex")
+            vertex.set("x", str(x))
+            vertex.set("y", str(y))
+        tree = ET.ElementTree(root)
+        tree.write(filename, encoding="utf-8", xml_declaration=True)
+
+    def load_from_xml(self, filename):
+        try:
+            tree = ET.parse(filename)
+            root = tree.getroot()
+            # Загружаем размер поля
+            size = root.find("size")
+            new_rows = int(size.get("rows"))
+            new_cols = int(size.get("cols"))
+            self.resize(new_rows, new_cols)
+            # Загружаем вершины
+            self.vertices = []
+            vertices = root.find("vertices")
+            for vertex in vertices.findall("vertex"):
+                x = int(vertex.get("x"))
+                y = int(vertex.get("y"))
+                self.vertices.append((x, y))
+            self.update_field()
+        except Exception as e:
+            raise Exception(f"Ошибка при загрузке файла: {str(e)}")
