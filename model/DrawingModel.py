@@ -3,14 +3,14 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from PIL import Image, ImageTk
 
-# Добавим небольшой отступ при расчете размера сетки по точкам
-GRID_MARGIN = 5
+GRID_MARGIN = 5 # Отступ при авто-определении размера сетки из XML
 
 class DrawingModel:
     """
     Модель данных для редактора шаблонов.
-    ИЗМЕНЕНО: Загрузка/сохранение только в формате <polygon>.
-             load_from_xml определяет размер сетки по точкам.
+    Хранит информацию о размере поля, вершинах, состоянии пиксельного поля,
+    физической высоте шаблона, истории для Undo/Redo и данных для оверлея.
+    Загрузка/сохранение только в формате <polygon>.
     """
     def __init__(self, rows, cols):
         self.rows = rows
@@ -23,8 +23,8 @@ class DrawingModel:
         self.overlay_offset_x = 0
         self.overlay_offset_y = 0
         self.overlay_scale = 1.0
+        self.template_physical_height_meters = 0.0 # Физическая высота шаблона в метрах
 
-    # --- Методы добавления/отмены вершин (без изменений) ---
     def add_vertex(self, x, y):
         try: x_int = int(round(x)); y_int = int(round(y))
         except (ValueError, TypeError): return False
@@ -49,7 +49,6 @@ class DrawingModel:
         else: self.undo_stack.pop(); self.redo_stack.append(vertex_to_redo); return False
         self.update_field(); return True
 
-    # --- Методы обновления поля и рисования (без изменений) ---
     def update_field(self):
         self.pixel_field = [[0 for _ in range(self.cols)] for _ in range(self.rows)]
         for vertex in self.vertices:
@@ -76,31 +75,35 @@ class DrawingModel:
             if e2 > -dy: err -= dy; x_curr += sx
             if e2 < dx: err += dx; y_curr += sy
 
-    # --- Методы управления состоянием (без изменений) ---
     def clear(self):
         self.vertices = []; self.pixel_field = [[0 for _ in range(self.cols)] for _ in range(self.rows)]
         self.undo_stack.clear(); self.redo_stack.clear()
+        # Физическую высоту НЕ сбрасываем при простой очистке поля,
+        # она должна сбрасываться/устанавливаться при загрузке нового шаблона или изменении размера.
+        # При изменении размера ее сбрасывать не надо, если пользователь явно ее не меняет.
 
     def resize(self, new_rows, new_cols):
         if new_rows > 0 and new_cols > 0:
             self.rows = new_rows; self.cols = new_cols
-            self.clear(); return True # Clear очистит вершины и историю
+            # Важно: очищаем вершины и историю, т.к. старые вершины могут быть вне новых границ.
+            # Физическую высоту шаблона не трогаем, она не зависит от размера сетки.
+            self.vertices = []
+            self.pixel_field = [[0 for _ in range(self.cols)] for _ in range(self.rows)]
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            return True
         return False
 
     def get_vertices_string(self):
         if not self.vertices: return "(пусто)"
         return " -> ".join(f"({int(v[0])},{int(v[1])})" for v in self.vertices)
 
-    # --- ИЗМЕНЕННЫЕ МЕТОДЫ СОХРАНЕНИЯ/ЗАГРУЗКИ XML ---
-
     def save_to_xml(self, filename):
-        """
-        Сохраняет текущее состояние (размер сетки, ВЕРШИНЫ) в XML-файл
-        в формате <polygon> с <point X="..." Y="..."/>.
-        """
         root = ET.Element("polygon")
-        root.set("grid_rows", str(self.rows)) # Сохраняем размер сетки
+        root.set("grid_rows", str(self.rows))
         root.set("grid_cols", str(self.cols))
+        root.set("physical_height_m", f"{self.template_physical_height_meters:.3f}") # Сохраняем с 3 знаками
+
         for x, y in self.vertices:
             point = ET.SubElement(root, "point")
             point.set("X", str(int(x)))
@@ -110,63 +113,67 @@ class DrawingModel:
             ET.indent(tree, space="\t", level=0)
             tree.write(filename, encoding="utf-8", xml_declaration=True)
         except Exception as e:
-            raise Exception(f"Ошибка при записи XML файла '{filename}': {str(e)}")
+            raise Exception(f"Ошибка при записи XML '{filename}': {str(e)}")
 
     def load_from_xml(self, filename):
-        """
-        Загружает вершины из XML-файла формата <polygon>.
-        Определяет размер сетки по максимальным координатам вершин.
-        Обновляет модель и сбрасывает историю.
-        """
         try:
-            tree = ET.parse(filename)
-            root = tree.getroot()
+            tree = ET.parse(filename); root = tree.getroot()
+            if root.tag != 'polygon': raise ValueError(f"Ожидался <polygon>, получен '<{root.tag}>'")
 
-            if root.tag != 'polygon':
-                 raise ValueError(f"Неверный формат файла: ожидался <polygon>, получен '<{root.tag}>'")
+            # Загрузка физической высоты шаблона
+            height_str = root.get("physical_height_m")
+            if height_str is not None:
+                try: self.template_physical_height_meters = float(height_str)
+                except ValueError: self.template_physical_height_meters = 0.0; print(f"Предупреждение: некорректный physical_height_m ('{height_str}')")
+            else: self.template_physical_height_meters = 0.0; print(f"Предупреждение: physical_height_m не найден")
 
-            # 1. Сначала читаем ВСЕ точки в временный список
-            temp_vertices = []
-            max_x = -1
-            max_y = -1
+            # Чтение вершин и определение размеров сетки
+            temp_vertices = []; max_x = -1; max_y = -1
             for point in root.findall("point"):
                 x_str = point.get("X"); y_str = point.get("Y")
                 if x_str is None or y_str is None: continue
                 try:
                     x = int(x_str); y = int(y_str)
-                    if x < 0 or y < 0: # Координаты не могут быть отрицательными
-                        print(f"Предупреждение: Пропущен <point> с отрицательными координатами ({x},{y}).")
-                        continue
+                    if x < 0 or y < 0: continue
                     temp_vertices.append((x, y))
-                    # Обновляем максимальные координаты
                     if x > max_x: max_x = x
                     if y > max_y: max_y = y
+                except ValueError: continue
+
+            if not temp_vertices: raise ValueError("В файле не найдено корректных вершин <point>.")
+
+            # Определение размера сетки по точкам + отступ
+            # Либо используем grid_rows/grid_cols из файла, если они есть (предпочтительнее)
+            g_rows_str = root.get("grid_rows")
+            g_cols_str = root.get("grid_cols")
+            resized_by_grid_attr = False
+            if g_rows_str and g_cols_str:
+                try:
+                    new_r, new_c = int(g_rows_str), int(g_cols_str)
+                    if new_r > 0 and new_c > 0:
+                        if not self.resize(new_r, new_c): raise ValueError("Не удалось изменить размер по grid_rows/cols")
+                        resized_by_grid_attr = True
                 except ValueError:
-                    print(f"Предупреждение: Пропущен <point> с нечисловыми координатами X='{x_str}', Y='{y_str}'.")
-                    continue
+                    print("Предупреждение: некорректные grid_rows/cols, размер будет определен по точкам.")
 
-            if not temp_vertices:
-                raise ValueError("В файле не найдено корректных вершин <point>.")
+            if not resized_by_grid_attr: # Если grid_rows/cols не было или они некорректны
+                required_rows = max_y + 1 + GRID_MARGIN
+                required_cols = max_x + 1 + GRID_MARGIN
+                if not self.resize(required_rows, required_cols):
+                     raise ValueError(f"Не удалось установить расчетный размер сетки ({required_rows}x{required_cols})")
 
-            # 2. Определяем необходимый размер сетки по максимальным координатам + отступ
-            # Нумерация с 0, поэтому размер = max_coord + 1 + margin
-            required_rows = max_y + 1 + GRID_MARGIN
-            required_cols = max_x + 1 + GRID_MARGIN
-
-            # 3. Изменяем размер сетки (это очистит self.vertices и историю)
-            if not self.resize(required_rows, required_cols):
-                 raise ValueError(f"Не удалось установить расчетный размер сетки ({required_rows}x{required_cols})")
-
-            # 4. Теперь добавляем вершины из временного списка в основной
-            # Проверка границ не нужна, т.к. мы установили достаточный размер
-            # Проверка дубликатов остается
+            # Добавляем вершины, проверяя их на попадание в текущие (возможно, новые) границы сетки
             final_vertices = []
             for x, y in temp_vertices:
-                if (x, y) not in final_vertices:
-                    final_vertices.append((x, y))
-            self.vertices = final_vertices
+                if 0 <= x < self.cols and 0 <= y < self.rows: # Проверка на текущие self.cols, self.rows
+                    if (x, y) not in final_vertices:
+                        final_vertices.append((x, y))
+                else:
+                    print(f"Предупреждение: Вершина ({x},{y}) вне установленных границ сетки ({self.rows}x{self.cols}), пропущена.")
 
-            # 5. Обновляем pixel_field
+            self.vertices = final_vertices
+            self.undo_stack.clear() # Очищаем историю после загрузки
+            self.redo_stack.clear()
             self.update_field()
 
         except ET.ParseError as e: raise Exception(f"Ошибка парсинга XML '{filename}': {str(e)}")
@@ -174,8 +181,6 @@ class DrawingModel:
         except (ValueError, TypeError, AttributeError, KeyError) as e: raise Exception(f"Ошибка в структуре/данных '{filename}': {str(e)}")
         except Exception as e: raise Exception(f"Неизвестная ошибка при загрузке '{filename}': {str(e)}")
 
-
-    # --- Методы для оверлея (без изменений) ---
     def load_overlay_image(self, filename):
         try:
             self.overlay_image_pil = Image.open(filename)
